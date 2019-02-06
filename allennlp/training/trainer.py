@@ -1,4 +1,4 @@
-
+import json
 import logging
 import math
 import os
@@ -8,13 +8,14 @@ import datetime
 import traceback
 from typing import Dict, Optional, List, Tuple, Union, Iterable, Any, NamedTuple
 
+import numpy
 import torch
 import torch.optim.lr_scheduler
 
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError
 from allennlp.common.util import (dump_metrics, gpu_memory_mb, parse_cuda_device, peak_memory_mb,
-                                  get_frozen_and_tunable_parameter_names, lazy_groups_of)
+                                  get_frozen_and_tunable_parameter_names, lazy_groups_of, sanitize)
 from allennlp.common.tqdm import Tqdm
 from allennlp.data.instance import Instance
 from allennlp.data.iterators.data_iterator import DataIterator, TensorDict
@@ -62,7 +63,8 @@ class Trainer(TrainerBase):
                  should_log_parameter_statistics: bool = True,
                  should_log_learning_rate: bool = False,
                  log_batch_size_period: Optional[int] = None,
-                 moving_average: Optional[MovingAverage] = None) -> None:
+                 moving_average: Optional[MovingAverage] = None,
+                 predict_output_file: str = None) -> None:
         """
         A trainer for doing supervised learning. It just takes a labeled dataset
         and a ``DataIterator``, and uses the supplied ``Optimizer`` to learn the weights
@@ -246,10 +248,19 @@ class Trainer(TrainerBase):
         if histogram_interval is not None:
             self._tensorboard.enable_activation_logging(self.model)
 
+        if predict_output_file is not None:
+            if serialization_dir is None:
+                raise ConfigurationError("predict_output_file was set but serialization_dir is None. Please"
+                                         "pass a serialization_dir param")
+            self._predict_output_file = open(os.path.join(serialization_dir, predict_output_file), "w")
+        else:
+            self._predict_output_file = None
+
     def rescale_gradients(self) -> Optional[float]:
         return training_util.rescale_gradients(self.model, self._grad_norm)
 
-    def batch_loss(self, batch_group: List[TensorDict], for_training: bool) -> torch.Tensor:
+    def batch_loss(self, batch_group: List[TensorDict], for_training: bool,
+                   return_output: bool = False) -> torch.Tensor:
         """
         Does a forward pass on the given batches and returns the ``loss`` value in the result.
         If ``for_training`` is `True` also applies regularization penalty.
@@ -272,7 +283,10 @@ class Trainer(TrainerBase):
                                    " 'loss' key in the output of model.forward(inputs).")
             loss = None
 
-        return loss
+        if return_output:
+            return loss, output_dict
+        else:
+            return loss
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -427,7 +441,7 @@ class Trainer(TrainerBase):
         val_loss = 0
         for batch_group in val_generator_tqdm:
 
-            loss = self.batch_loss(batch_group, for_training=False)
+            loss, outputs = self.batch_loss(batch_group, for_training=False, return_output=True)
             if loss is not None:
                 # You shouldn't necessarily have to compute a loss for validation, so we allow for
                 # `loss` to be None.  We need to be careful, though - `batches_this_epoch` is
@@ -436,6 +450,32 @@ class Trainer(TrainerBase):
                 # gets used for something else, we might need to change things around a bit.
                 batches_this_epoch += 1
                 val_loss += loss.detach().cpu().numpy()
+
+            if self._predict_output_file:
+                if len(batch_group) > 1:
+                    raise ConfigurationError("Multiple GPUs are not supported for predict output file")
+
+                batch_size = len(batch_group[0]['world'])  # TODO: Get actual batch size...?
+
+                instance_separated_output: List[Dict[str, numpy.ndarray]] = [{} for _ in range(batch_size)]
+                for name, output in list(outputs.items()):
+                    if isinstance(output, torch.Tensor):
+                        # NOTE(markn): This is a hack because 0-dim pytorch tensors are not iterable.
+                        # This occurs with batch size 1, because we still want to include the loss in that case.
+                        if output.dim() == 0:
+                            output = output.unsqueeze(0)
+
+                        if output.size(0) != batch_size:
+                            # self._maybe_warn_for_unseparable_batches(name)
+                            continue
+                        output = output.detach().cpu().numpy()
+                    elif len(output) != batch_size:
+                        # self._maybe_warn_for_unseparable_batches(name)
+                        continue
+                    for instance_output, batch_element in zip(instance_separated_output, output):
+                        instance_output[name] = batch_element
+                for row in instance_separated_output:
+                    self._predict_output_file.write(json.dumps(sanitize(row)) + "\r\n")
 
             # Update the description with the latest metrics
             val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch)
@@ -446,7 +486,7 @@ class Trainer(TrainerBase):
         if self._moving_average is not None:
             self._moving_average.restore()
 
-        return val_loss, batches_this_epoch
+        return val_loss, batches_this_epoch,
 
     def train(self) -> Dict[str, Any]:
         """
@@ -673,6 +713,7 @@ class Trainer(TrainerBase):
         grad_clipping = params.pop_float("grad_clipping", None)
         lr_scheduler_params = params.pop("learning_rate_scheduler", None)
         momentum_scheduler_params = params.pop("momentum_scheduler", None)
+        predict_output_file = params.pop("predict_output_file", None)
 
         if isinstance(cuda_device, list):
             model_device = cuda_device[0]
@@ -743,7 +784,8 @@ class Trainer(TrainerBase):
                    should_log_parameter_statistics=should_log_parameter_statistics,
                    should_log_learning_rate=should_log_learning_rate,
                    log_batch_size_period=log_batch_size_period,
-                   moving_average=moving_average)
+                   moving_average=moving_average,
+                   predict_output_file=predict_output_file)
 
 
 class TrainerPieces(NamedTuple):
