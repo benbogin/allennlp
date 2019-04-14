@@ -6,6 +6,7 @@ import time
 import re
 import datetime
 import traceback
+import gzip
 from typing import Dict, Optional, List, Tuple, Union, Iterable, Any, NamedTuple
 
 import numpy
@@ -428,6 +429,8 @@ class Trainer(TrainerBase):
         else:
             val_iterator = self.iterator
 
+        predict_output = []
+
         num_gpus = len(self._cuda_devices)
 
         raw_val_generator = val_iterator(self._validation_data,
@@ -475,7 +478,7 @@ class Trainer(TrainerBase):
                     for instance_output, batch_element in zip(instance_separated_output, output):
                         instance_output[name] = batch_element
                 for row in instance_separated_output:
-                    self._predict_output_file.write(json.dumps(sanitize(row)) + "\r\n")
+                    predict_output.append(row)
 
             # Update the description with the latest metrics
             val_metrics = training_util.get_metrics(self.model, val_loss, batches_this_epoch)
@@ -486,7 +489,7 @@ class Trainer(TrainerBase):
         if self._moving_average is not None:
             self._moving_average.restore()
 
-        return val_loss, batches_this_epoch,
+        return val_loss, batches_this_epoch, predict_output
 
     def train(self) -> Dict[str, Any]:
         """
@@ -530,7 +533,7 @@ class Trainer(TrainerBase):
             if self._validation_data is not None:
                 with torch.no_grad():
                     # We have a validation set, so compute all the metrics on it.
-                    val_loss, num_batches = self._validation_loss()
+                    val_loss, num_batches, predict_output = self._validation_loss()
                     val_metrics = training_util.get_metrics(self.model, val_loss, num_batches, reset=True)
 
                     # Check validation metric for early stopping
@@ -564,6 +567,14 @@ class Trainer(TrainerBase):
                 metrics['best_epoch'] = epoch
                 for key, value in val_metrics.items():
                     metrics["best_validation_" + key] = value
+
+                if self._predict_output_file:
+                    if self._serialization_dir is None:
+                        raise ConfigurationError("predict_output_file was set but serialization_dir is None. Please"
+                                                 "pass a serialization_dir param")
+                    with gzip.open(os.path.join(self._serialization_dir, f"predict_best.json.gz"), "wt") as pred_file:
+                        for row in predict_output:
+                            print(json.dumps(sanitize(row)), file=pred_file)
 
                 self._metric_tracker.best_epoch_metrics = val_metrics
 
